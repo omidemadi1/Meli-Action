@@ -24,25 +24,10 @@ on:
         default: ""
 
       max_part_mb:
-        description: "حداکثر حجم هر قسمت (MB) - 0 یعنی خودکار 1800"
+        description: "حداکثر حجم هر پارت (MB)"
         required: false
         type: string
         default: "1800"
-
-      upload_method:
-        description: "روش ذخیره نهایی"
-        required: true
-        type: choice
-        options:
-          - repository
-          - release
-        default: repository
-
-      release_tag:
-        description: "تگ ریلیز (فقط برای حالت release)"
-        required: false
-        type: string
-        default: ""
 
 permissions:
   contents: write
@@ -64,8 +49,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           sudo apt-get update
-          sudo apt-get install -y curl python3 python3-pip zip
+
+          sudo apt-get install -y \
+            curl \
+            zip \
+            python3 \
+            python3-pip
+
           pip3 install --quiet requests==2.32.3
 
       - name: Get Download Link
@@ -89,91 +81,159 @@ jobs:
           desired_quality = os.environ.get("DESIRED_QUALITY", "").strip()
 
           if not video_url.startswith(("http://", "https://")):
-              raise Exception("Invalid video URL")
+              raise Exception("Invalid YouTube URL")
 
           if output_format not in ("mp4", "mp3"):
               raise Exception("Invalid output format")
 
-          quality = desired_quality or ("720p" if output_format == "mp4" else "192kbps")
+          quality = desired_quality or (
+              "720p" if output_format == "mp4" else "192kbps"
+          )
+
+          endpoints = [
+              "https://hub.ytconvert.org/api/download",
+              "https://media.ytmp3.gg/api/convert"
+          ]
 
           session = requests.Session()
+
           session.headers.update({
-              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+              "User-Agent": (
+                  "Mozilla/5.0 (X11; Linux x86_64) "
+                  "AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) "
+                  "Chrome/125 Safari/537.36"
+              )
           })
 
-          # Warm-up request, if the provider expects a browser-like session
-          session.get("https://media.ytmp3.gg/", timeout=30)
+          # warm-up
+          try:
+              session.get("https://media.ytmp3.gg/", timeout=20)
+          except:
+              pass
 
-          if output_format == "mp4":
-              api_url = "https://hub.ytconvert.org/api/download"
-              payload = {
-                  "url": video_url,
-                  "os": "linux",
-                  "output": {
-                      "type": "video",
-                      "format": "mp4",
-                      "quality": quality
-                  }
+          payload = {
+              "url": video_url,
+              "os": "linux",
+              "output": {
+                  "type": "audio" if output_format == "mp3" else "video",
+                  "format": output_format
+              }
+          }
+
+          if output_format == "mp3":
+              payload["audio"] = {
+                  "bitrate": quality
               }
           else:
-              api_url = "https://hub.ytconvert.org/api/download"
-              payload = {
-                  "url": video_url,
-                  "os": "linux",
-                  "output": {
-                      "type": "audio",
-                      "format": "mp3"
-                  },
-                  "audio": {
-                      "bitrate": quality
-                  }
-              }
+              payload["output"]["quality"] = quality
 
-          resp = session.post(api_url, json=payload, timeout=30)
-          resp.raise_for_status()
-          data = resp.json()
+          response_data = None
+          used_endpoint = None
 
-          status_url = data.get("statusUrl") or data.get("status_url") or data.get("url")
-          title = data.get("title", "video")
+          for endpoint in endpoints:
+              try:
+                  print(f"Trying endpoint: {endpoint}")
 
-          if not status_url:
-              raise Exception("No status URL returned by API")
+                  resp = session.post(
+                      endpoint,
+                      json=payload,
+                      timeout=30
+                  )
 
-          download_url = None
-          for _ in range(150):
-              time.sleep(2)
-              r = session.get(status_url, timeout=30)
-              r.raise_for_status()
-              status = r.json()
+                  resp.raise_for_status()
 
-              if status.get("status") == "completed":
-                  download_url = status.get("downloadUrl") or status.get("download_url") or status.get("url")
-                  if not download_url:
-                      raise Exception("Completed but no download URL returned")
+                  response_data = resp.json()
+                  used_endpoint = endpoint
+
+                  print(f"Success with: {endpoint}")
                   break
 
-              if status.get("status") == "failed":
-                  raise Exception("Server failed to prepare the file")
+              except Exception as e:
+                  print(f"Failed endpoint: {endpoint}")
+                  print(str(e))
+
+          if not response_data:
+              raise Exception("All endpoints failed")
+
+          status_url = (
+              response_data.get("statusUrl")
+              or response_data.get("status_url")
+              or response_data.get("url")
+          )
+
+          title = response_data.get("title", "youtube_media")
+
+          if not status_url:
+              raise Exception("No status URL returned")
+
+          download_url = None
+
+          for _ in range(150):
+              time.sleep(2)
+
+              r = session.get(status_url, timeout=30)
+              r.raise_for_status()
+
+              status = r.json()
+
+              current = status.get("status")
+
+              if current == "completed":
+                  download_url = (
+                      status.get("downloadUrl")
+                      or status.get("download_url")
+                      or status.get("url")
+                  )
+
+                  if not download_url:
+                      raise Exception("No download URL returned")
+
+                  break
+
+              if current == "failed":
+                  raise Exception("Conversion failed")
 
           if not download_url:
-              raise Exception("Timed out waiting for the download link")
+              raise Exception("Timeout waiting for conversion")
 
-          video_id_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', video_url)
-          video_id = video_id_match.group(1) if video_id_match else "youtube"
+          video_id_match = re.search(
+              r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})',
+              video_url
+          )
 
-          safe_title = re.sub(r'[^a-zA-Z0-9\-_()\\[\\]]', '_', title.replace(' ', '_'))
-          safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:70] or video_id
+          video_id = (
+              video_id_match.group(1)
+              if video_id_match
+              else "youtube"
+          )
+
+          safe_title = re.sub(
+              r'[^a-zA-Z0-9\-_()\[\]]',
+              '_',
+              title.replace(' ', '_')
+          )
+
+          safe_title = re.sub(
+              r'_+',
+              '_',
+              safe_title
+          ).strip('_')[:70]
+
+          if not safe_title:
+              safe_title = video_id
 
           filename = f"{safe_title}_{video_id}.{output_format}"
 
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"filename={filename}\n")
               f.write(f"title={title}\n")
               f.write(f"download_url={download_url}\n")
+              f.write(f"endpoint={used_endpoint}\n")
 
-          print(f"filename={filename}")
-          print(f"title={title}")
-          print(f"download_url={download_url}")
+          print("Download ready")
+          print("Endpoint:", used_endpoint)
+          print("Filename:", filename)
           PY
 
       - name: Download File
@@ -184,18 +244,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p release_files
+          mkdir -p downloads_temp
 
-          curl -L \
+          echo "Downloading: $FILENAME"
+
+          curl \
+            -L \
             --fail \
             --retry 5 \
             --retry-delay 5 \
             --retry-all-errors \
             --progress-bar \
-            -o "release_files/$FILENAME" \
+            -o "downloads_temp/$FILENAME" \
             "$DOWNLOAD_URL"
 
-          if [ ! -s "release_files/$FILENAME" ]; then
+          if [ ! -s "downloads_temp/$FILENAME" ]; then
             echo "Downloaded file is empty"
             exit 1
           fi
@@ -205,7 +268,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          FILE="release_files/${{ steps.retrieve.outputs.filename }}"
+          FILE="downloads_temp/${{ steps.retrieve.outputs.filename }}"
           THRESH_MB="${{ github.event.inputs.max_part_mb }}"
 
           if [ -z "$THRESH_MB" ] || [ "$THRESH_MB" = "0" ]; then
@@ -216,34 +279,39 @@ jobs:
 
           echo "File size: ${FILE_SIZE_MB} MB"
 
+          mkdir -p downloads
+
           if [ "$FILE_SIZE_MB" -gt "$THRESH_MB" ]; then
-            echo "Splitting large file..."
+            echo "Splitting file..."
 
             BASENAME=$(basename "$FILE")
             NAME="${BASENAME%.*}"
 
-            mkdir -p split_output
+            cd downloads_temp
 
-            zip -j "split_output/${NAME}.zip" "$FILE"
-            cd split_output
-            zip -s "${THRESH_MB}m" "${NAME}.zip" --out "${NAME}_split.zip"
+            zip -0 -s "${THRESH_MB}m" \
+              "../downloads/${NAME}.zip" \
+              "$BASENAME"
+
             cd ..
 
-            rm -f "$FILE"
-            mv split_output/* release_files/
-
             echo "Split completed"
+
           else
+            mv "$FILE" downloads/
             echo "No split needed"
           fi
 
-      - name: Get Current Date
-        id: get_date
+      - name: Generate Checksums
         shell: bash
-        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
 
-      - name: Push to Repository
-        if: github.event.inputs.upload_method == 'repository'
+          cd downloads
+
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Commit And Push
         shell: bash
         run: |
           set -euo pipefail
@@ -251,36 +319,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          mkdir -p downloads
-          mv release_files/* downloads/
+          git add downloads/
 
-          git add downloads
+          git commit -m \
+            "YouTube Download - ${{ steps.retrieve.outputs.filename }}" \
+            || echo "Nothing to commit"
 
-          git commit -m "Add YouTube download - ${{ steps.retrieve.outputs.filename }}" || echo "Nothing to commit"
+          git pull --rebase origin main || true
+
           git push
-
-      - name: Upload to GitHub Releases
-        if: github.event.inputs.upload_method == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
-          name: ${{ format('YouTube - {0}', steps.retrieve.outputs.filename) }}
-          body: |
-            **YouTube Download**
-
-            **Title:** ${{ steps.retrieve.outputs.title }}
-            **Original Link:** ${{ github.event.inputs.video_url }}
-            **Quality:** ${{ github.event.inputs.desired_quality }}
-            **Format:** ${{ github.event.inputs.output_format }}
-            **Downloaded on:** ${{ steps.get_date.outputs.date }}
-
-          files: release_files/*
-          token: ${{ secrets.GITHUB_TOKEN }}
-          draft: false
-          prerelease: false
 
       - name: Cleanup
         if: always()
         shell: bash
         run: |
-          rm -rf release_files split_output .download_info 2>/dev/null || true
+          rm -rf downloads_temp
