@@ -1,4 +1,4 @@
-name: YouTube Downloader
+name: دانلودر یوتیوب
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         type: string
 
       output_format:
-        description: 'Output Type'
+        description: 'نوع خروجی'
         required: true
         type: choice
         options:
@@ -18,16 +18,31 @@ on:
         default: 'mp4 (video)'
 
       desired_quality:
-        description: Quality | Video = 1080p, 720p & Audio = 192kbps, 320kbps
+        description: 'کیفیت (ویدیو: 720p, 1080p | صدا: 192kbps, 320kbps)'
         required: false
         type: string
-        default: '1080p'
+        default: '720p'
 
       max_part_mb:
-        description: 'Split (MB) | Max = 95MB'
+        description: 'حداکثر حجم هر قسمت (MB) - 0 = خودکار ۱۸۰۰ مگابایت'
         required: false
         type: string
         default: '90'
+
+      upload_method:
+        description: '📤 روش ذخیره نهایی'
+        required: true
+        type: choice
+        options:
+          - repository (push to repo)
+          - release (GitHub Releases)
+        default: 'repository (push to repo)'
+
+      release_tag:
+        description: '🏷️ نام تگ ریلیز (فقط در صورت انتخاب Release)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -171,6 +186,28 @@ jobs:
           git add downloads/
           git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename }} [skip ci]" || echo "Nothing to commit"
           git push
+
+      - name: 📤 Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release (GitHub Releases)'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('yt-{0}', github.run_number) }}
+          name: ${{ format('YouTube - {0}', steps.retrieve.outputs.filename) }}
+          body: |
+            **📽️ YouTube Download**
+
+            **Title:** ${{ steps.retrieve.outputs.title }}
+            **Original Link:** ${{ github.event.inputs.video_url }}
+            **Quality:** ${{ github.event.inputs.desired_quality }}
+            **Format:** ${{ github.event.inputs.output_format }}
+            **Downloaded on:** ${{ steps.get_date.outputs.date }}
+
+            ---
+            Powered by Meli-Action ⚡
+          files: release_files/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
 
       - name: 🧹 Cleanup
         if: always()
